@@ -1,0 +1,379 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# ENHANCEMENT ADDITIONS — add these blocks into log-aggregator-infra.yaml
+#
+# HOW TO ADD: Copy each section below into the corresponding section of your
+# existing log-aggregator-infra.yaml file.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADD TO: Parameters section
+# ─────────────────────────────────────────────────────────────────────────────
+
+  DummyAppDesiredCount:
+    Type: Number
+    Default: 1
+    Description: "Desired count for the dummy-infra-app ECS service."
+
+  ServiceNowSecretName:
+    Type: String
+    Default: "servicenow/credentials"
+    Description: "Secrets Manager secret name for ServiceNow credentials."
+
+  DummyAppServiceName:
+    Type: String
+    Default: "dummy-infra-app"
+    Description: "Name used for the dummy app ECS service and ECR repo."
+
+  RdsDbInstanceId:
+    Type: String
+    Default: ""
+    Description: "RDS instance identifier for DB remediation Lambda (optional)."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADD TO: Resources section — after existing ECR repos (Section 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  EcrDummyAppRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "log-aggregator-dummy-app-${EnvironmentName}"
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"Keep last 5 images",
+          "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},
+          "action":{"type":"expire"}}]}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADD TO: Resources section — Secrets Manager (after BedrockSecret)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  ServiceNowSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Ref ServiceNowSecretName
+      Description: "ServiceNow credentials for auto-remediation integration"
+      SecretString: |
+        {
+          "instance_url": "https://YOUR_INSTANCE.service-now.com",
+          "username":     "aws-integration-user",
+          "password":     "REPLACE_WITH_REAL_PASSWORD"
+        }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADD TO: Resources section — IAM Roles (Section 9)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  # Role shared by all 5 action group Lambdas
+  ActionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "log-aggregator-action-lambda-role-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ActionLambdaPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Secrets Manager — for ServiceNow creds, SSL cert ARN, service account creds
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DescribeSecret
+                Resource: "*"
+              # ACM — for SSL cert renewal
+              - Effect: Allow
+                Action:
+                  - acm:RequestCertificate
+                  - acm:DescribeCertificate
+                  - acm:ListCertificates
+                Resource: "*"
+              # Route53 — for DNS validation
+              - Effect: Allow
+                Action:
+                  - route53:ChangeResourceRecordSets
+                  - route53:ListHostedZones
+                Resource: "*"
+              # RDS — for storage/instance remediation
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:ModifyDBInstance
+                Resource: "*"
+              # ECS — for compute scaling
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                Resource: "*"
+              # CloudWatch — for metrics
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+              # SSM Parameter Store
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                Resource: "*"
+
+  # Dummy app ECS task role
+  DummyAppTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "log-aggregator-dummy-app-task-role-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DummyAppS3Write
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt RawLogsBucket.Arn
+                  - !Sub "${RawLogsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADD TO: Resources section — CloudWatch Log Groups (Section 10)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  DummyAppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/log-aggregator-dummy-app-${EnvironmentName}"
+      RetentionInDays: 14
+
+  ServiceNowLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/log-aggregator-servicenow-${EnvironmentName}"
+      RetentionInDays: 14
+
+  SSLLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/log-aggregator-ssl-${EnvironmentName}"
+      RetentionInDays: 14
+
+  PasswordResetLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/log-aggregator-password-reset-${EnvironmentName}"
+      RetentionInDays: 14
+
+  DBLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/log-aggregator-db-${EnvironmentName}"
+      RetentionInDays: 14
+
+  ComputeLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/log-aggregator-compute-${EnvironmentName}"
+      RetentionInDays: 14
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADD TO: Resources section — after ECS Task Definitions (Section 12)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  DummyAppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "log-aggregator-dummy-app-${EnvironmentName}"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      TaskRoleArn: !GetAtt DummyAppTaskRole.Arn
+      ContainerDefinitions:
+        - Name: dummy-app
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/log-aggregator-dummy-app-${EnvironmentName}:latest"
+          PortMappings:
+            - ContainerPort: 5001
+              Protocol: tcp
+          Environment:
+            - Name: APP_PORT
+              Value: "5001"
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+            - Name: RAW_LOGS_BUCKET
+              Value: !Ref RawLogsBucket
+            - Name: RAW_LOGS_PREFIX
+              Value: "raw-logs/"
+            - Name: PYTHONUNBUFFERED
+              Value: "1"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref DummyAppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: dummy-app
+          Essential: true
+          HealthCheck:
+            Command: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5001/health')\" || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+
+  DummyAppService:
+    Type: AWS::ECS::Service
+    DependsOn: [AlbListener]
+    Properties:
+      ServiceName: !Sub "dummy-infra-app-svc-${EnvironmentName}"
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref DummyAppTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DummyAppDesiredCount
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref EcsTaskSecurityGroup]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADD TO: Resources section — after Lambda Processor (Section 15)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  ServiceNowLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: ServiceNowLambdaLogGroup
+    Properties:
+      FunctionName: !Sub "log-aggregator-servicenow-${EnvironmentName}"
+      Description: "Bedrock action group: creates ServiceNow incidents for detected errors"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt ActionLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          SERVICENOW_SECRET_NAME: !Ref ServiceNowSecretName
+          AWS_DEFAULT_REGION:     !Ref AWS::Region
+
+  SSLRemediationLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: SSLLambdaLogGroup
+    Properties:
+      FunctionName: !Sub "log-aggregator-ssl-${EnvironmentName}"
+      Description: "Bedrock action group: ACM certificate renewal and rotation"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt ActionLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          DUMMY_APP_URL:         !Sub "http://dummy-infra-app-svc-${EnvironmentName}:5001"
+          AWS_DEFAULT_REGION:    !Ref AWS::Region
+          SSL_CERT_SECRET_NAME:  "dummy-app/ssl-cert-arn"
+
+  PasswordResetLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: PasswordResetLambdaLogGroup
+    Properties:
+      FunctionName: !Sub "log-aggregator-password-reset-${EnvironmentName}"
+      Description: "Bedrock action group: Secrets Manager password rotation"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt ActionLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          DUMMY_APP_URL:            !Sub "http://dummy-infra-app-svc-${EnvironmentName}:5001"
+          SERVICE_ACCOUNT_SECRET:   "dummy-app/service-account-credentials"
+          AWS_DEFAULT_REGION:       !Ref AWS::Region
+
+  DBRemediationLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: DBLambdaLogGroup
+    Properties:
+      FunctionName: !Sub "log-aggregator-db-${EnvironmentName}"
+      Description: "Bedrock action group: RDS storage increase and instance upgrade"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt ActionLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          RDS_DB_INSTANCE_ID: !Ref RdsDbInstanceId
+          AWS_DEFAULT_REGION: !Ref AWS::Region
+
+  ComputeRemediationLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: ComputeLambdaLogGroup
+    Properties:
+      FunctionName: !Sub "log-aggregator-compute-${EnvironmentName}"
+      Description: "Bedrock action group: ECS desired count scale-up"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt ActionLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          ECS_CLUSTER_NAME:        !Ref EcsCluster
+          DUMMY_APP_SERVICE_NAME:  !Sub "dummy-infra-app-svc-${EnvironmentName}"
+          MAX_DESIRED_COUNT:       "4"
+          AWS_DEFAULT_REGION:      !Ref AWS::Region
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADD TO: Outputs section
+# ─────────────────────────────────────────────────────────────────────────────
+
+  DummyAppEcrUri:
+    Description: "ECR URI for dummy-infra-app — build and push your image here"
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/log-aggregator-dummy-app-${EnvironmentName}"
+
+  ServiceNowLambdaArn:
+    Description: "ServiceNow Lambda ARN — add to Bedrock action group"
+    Value: !GetAtt ServiceNowLambda.Arn
+
+  SSLLambdaArn:
+    Description: "SSL Remediation Lambda ARN — add to Bedrock action group"
+    Value: !GetAtt SSLRemediationLambda.Arn
+
+  PasswordResetLambdaArn:
+    Description: "Password Reset Lambda ARN — add to Bedrock action group"
+    Value: !GetAtt PasswordResetLambda.Arn
+
+  DBLambdaArn:
+    Description: "DB Remediation Lambda ARN — add to Bedrock action group"
+    Value: !GetAtt DBRemediationLambda.Arn
+
+  ComputeLambdaArn:
+    Description: "Compute Remediation Lambda ARN — add to Bedrock action group"
+    Value: !GetAtt ComputeRemediationLambda.Arn
+
+  ServiceNowSecretArn:
+    Description: "Secrets Manager secret for ServiceNow — update with real credentials"
+    Value: !Ref ServiceNowSecret
